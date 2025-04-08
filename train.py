@@ -86,10 +86,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+        
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))  # + 0.07 * torch.exp(gaussians._scaling).norm()   # + 0.03 * torch.exp(gaussians._scaling).norm()  
         loss.backward()
 
         iter_end.record()
@@ -153,6 +154,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
+
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
@@ -184,14 +186,134 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                return psnr_test
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+    return None
+
+
+
+def train_opacity_only(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    """
+    从检查点开始训练，固定高斯点的数量，只训练opacity参数
+    """
+    if not checkpoint:
+        print("错误: 必须提供检查点文件以进行仅opacity训练")
+        return
+    
+    first_iter = 0
+    tb_writer = prepare_output_and_logger(dataset)
+    gaussians = GaussianModel(dataset.sh_degree)
+    scene = Scene(dataset, gaussians)
+    
+    # 从检查点加载模型
+    print(f"从检查点加载模型: {checkpoint}")
+    gaussians.load_ply(checkpoint)
+    
+    # 特殊设置：只训练opacity
+    def setup_opacity_only_training():
+        # 仅优化opacity参数
+        l = [{'params': [gaussians._opacity], 'lr': opt.opacity_lr, "name": "opacity"}]
+        gaussians.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+    
+    # 设置优化器只优化opacity
+    # setup_opacity_only_training()
+    gaussians.training_setup(opt, only_shs=False, wo_xyz=True)
+    print("不优化xyz参数,其他参数优化")
+    
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    iter_start = torch.cuda.Event(enable_timing = True)
+    iter_end = torch.cuda.Event(enable_timing = True)
+
+    viewpoint_stack = None
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="仅训练Opacity")
+    first_iter += 1
+    
+    for iteration in range(first_iter, opt.iterations + 1):        
+        if network_gui.conn == None:
+            network_gui.try_connect()
+        while network_gui.conn != None:
+            try:
+                net_image_bytes = None
+                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                if custom_cam != None:
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                network_gui.send(net_image_bytes, dataset.source_path)
+                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                    break
+            except Exception as e:
+                network_gui.conn = None
+
+        iter_start.record()
+
+        # 不更新学习率，使用固定的opacity学习率
+
+        # 随机选择一个相机视角
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        # 渲染
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+
+        bg = torch.rand((3), device="cuda") if opt.random_background else background
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        # 计算损失
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image)
+        # 注意：移除了scaling正则化项，因为我们不更新scaling
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss.backward()
+
+        iter_end.record()
+
+        with torch.no_grad():
+            # 进度条更新
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.update(10)
+            if iteration == opt.iterations:
+                progress_bar.close()
+
+            # 日志记录和保存
+            psnr_value = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            if (iteration in saving_iterations):
+                print(f"\n[ITER {iteration}] 保存高斯模型")
+                scene.save(iteration)
+                
+            if (iteration in saving_iterations):
+                # 使用training_report中的PSNR值进行判断
+                if psnr_value > 32:  # 使用training_report中的psnr_test
+                    print(f"\n[ITER {iteration}] PSNR大于32，保存检查点")
+                    torch.save((gaussians.capture(), iteration), scene.model_path + f"/opacity_only_chkpnt{iteration}.pth")
+
+            # 注意：不进行密度化和剪枝！
+
+            # 优化器步骤
+            if iteration < opt.iterations:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad()
+
+            if (iteration in checkpoint_iterations):
+                print(f"\n[ITER {iteration}] 保存检查点")
+                torch.save((gaussians.capture(), iteration), scene.model_path + f"/opacity_only_chkpnt{iteration}.pth")
+
+
 
 if __name__ == "__main__":
-    # Set up command line argument parser
+    # 设置命令行参数解析
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -200,23 +322,41 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5_000 , 30_000, 50_000, 80_000, 100_000, 150_000, 200_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[5_000 , 30_000, 50_000, 80_000, 100_000, 150_000, 200_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    # 添加新参数
+    parser.add_argument("--opacity_only", action="store_true", help="仅训练opacity参数,固定其他参数")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
+    # 初始化系统状态(RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    # 启动GUI服务器，配置并运行训练
+    network_gui.init(args.ip, args.port)  
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    
+    # 根据选项选择训练函数
+    if args.opacity_only:
+        if not args.start_checkpoint:
+            print("错误: 仅opacity训练模式必须提供--start_checkpoint参数")
+            sys.exit(1)
+        print("仅训练opacity模式，从检查点加载并固定高斯数量")
+        train_opacity_only(lp.extract(args), op.extract(args), pp.extract(args), 
+                          args.test_iterations, args.save_iterations, 
+                          args.checkpoint_iterations, args.start_checkpoint, 
+                          args.debug_from)
+    else:
+        # 原始完整训练
+        training(lp.extract(args), op.extract(args), pp.extract(args), 
+                args.test_iterations, args.save_iterations, 
+                args.checkpoint_iterations, args.start_checkpoint, 
+                args.debug_from)
 
-    # All done
-    print("\nTraining complete.")
+    # 完成
+    print("\n训练完成。")

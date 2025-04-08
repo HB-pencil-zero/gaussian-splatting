@@ -146,19 +146,36 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def training_setup(self, training_args):
+    def training_setup(self, training_args , only_shs = False, wo_xyz = False):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        l = [
-            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
-        ]
+        if only_shs:
+            lr_scale = 1
+            l = [
+                {'params': [self._features_dc], 'lr': training_args.feature_lr * lr_scale, "name": "f_dc"},
+                {'params': [self._features_rest], 'lr': training_args.feature_lr / 20 * lr_scale, "name": "f_rest"},
+                # {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+            ]
+        elif wo_xyz:
+            l = [
+                {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+                {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            ]
+        else :
+            lr_scale = 1
+            l = [
+                {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale * lr_scale, "name": "xyz"},
+                {'params': [self._features_dc], 'lr': training_args.feature_lr * lr_scale, "name": "f_dc"},
+                {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0 * lr_scale, "name": "f_rest"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr * lr_scale, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr * lr_scale, "name": "rotation"}
+            ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -212,9 +229,56 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    def load_ply(self, path):
-        plydata = PlyData.read(path)
+    from plyfile import PlyData
 
+    def check_attribute_shapes(self, ply_file):
+        """
+        检查 .ply 文件中所有属性的值是否与 `x` 的形状一致。
+
+        参数:
+            ply_file (str): .ply 文件路径。
+
+        返回:
+            dict: 每个属性及其与 `x` 的形状是否一致。
+        """
+        # 加载 .ply 文件
+        plydata = PlyData.read(ply_file)
+        
+        # 获取 `x` 的形状
+        x_shape = plydata['vertex']['x'].shape
+
+        # 存储属性和结果
+        results = {}
+
+        # 遍历所有属性，检查形状
+        for attribute in plydata['vertex'].data.dtype.names:
+            attr_shape = plydata['vertex'][attribute].shape
+            results[attribute] = (attr_shape == x_shape)
+
+        return results
+
+
+    
+    
+    def load_ply(self, path, default_filling=True):
+        plydata = PlyData.read(path)
+        
+        
+        
+        # flag_path = os.path.join(os.path.dirname(path), 'filled.pt')
+    
+        # # 检查是否存在标志文件
+        # if os.path.exists(flag_path):
+        #     self.filled = torch.load(flag_path)
+        # else:
+        #     # 默认为True并保存
+        #     self.filled = torch.tensor(default_filling)
+        #     torch.save(self.filled, flag_path)
+
+
+        # plydata2 = filter_ply_entries_by_hyperplane(plydata)
+        # plydata3 = filter_ply_entries_by_hyperplane(plydata2, b=0.1, pos=False)
+        # plydata = plydata3
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
@@ -405,3 +469,195 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+        
+    
+    def fill_interior(self, voxel_resolution=128, density_threshold=0.1, scaling_factor=1/3000, opacity_value=0.99):
+        """
+        填充3D对象内部的空白区域，实现FruitNinja中描述的OpaqueAtom GS策略填充方法。
+        
+        参数:
+            voxel_resolution (int): 3D体素网格的分辨率
+            density_threshold (float): 判断区域为空的密度阈值
+            scaling_factor (float): 高斯粒子大小的缩放因子 (相对于场景尺寸的比例)
+            opacity_value (float): 填充粒子的不透明度值 (接近1表示完全不透明)
+        """
+        import torch
+        import numpy as np
+        from torch.nn.functional import conv3d
+        from simple_knn._C import distCUDA2  # 使用已有的distCUDA2替代knnsearch
+        
+        # 计算场景边界
+        xyz = self.get_xyz.detach()
+        min_coords = torch.min(xyz, dim=0).values
+        max_coords = torch.max(xyz, dim=0).values
+        scene_extent = torch.max(max_coords - min_coords)
+        
+        # 创建体素网格
+        print(f"创建3D体素网格: {voxel_resolution}x{voxel_resolution}x{voxel_resolution}")
+        voxel_size = scene_extent / voxel_resolution
+        grid_min = min_coords - voxel_size
+        grid_max = max_coords + voxel_size
+        
+        # 初始化密度网格
+        density_grid = torch.zeros((voxel_resolution, voxel_resolution, voxel_resolution), 
+                                device=xyz.device, dtype=torch.float)
+        
+        # 为体素网格创建中心点坐标
+        steps = torch.linspace(0, voxel_resolution-1, voxel_resolution, device=xyz.device)
+        grid_x = grid_min[0] + steps * (grid_max[0] - grid_min[0]) / (voxel_resolution - 1)
+        grid_y = grid_min[1] + steps * (grid_max[1] - grid_min[1]) / (voxel_resolution - 1)
+        grid_z = grid_min[2] + steps * (grid_max[2] - grid_min[2]) / (voxel_resolution - 1)
+        
+        # 计算每个粒子对密度网格的贡献
+        scaling = self.get_scaling.detach()
+        opacity = self.get_opacity.detach()
+        
+        # 对每个体素进行密度采样
+        print("计算密度网格...")
+        
+        # 采样点限制，避免内存溢出
+        sample_limit = 10000
+        num_particles = xyz.shape[0]
+        
+        for i in range(0, num_particles, sample_limit):
+            end_idx = min(i + sample_limit, num_particles)
+            batch_xyz = xyz[i:end_idx]
+            batch_opacity = opacity[i:end_idx]
+            
+            # 计算体素索引
+            voxel_idx_x = ((batch_xyz[:, 0] - grid_min[0]) / (grid_max[0] - grid_min[0]) * (voxel_resolution - 1)).long()
+            voxel_idx_y = ((batch_xyz[:, 1] - grid_min[1]) / (grid_max[1] - grid_min[1]) * (voxel_resolution - 1)).long()
+            voxel_idx_z = ((batch_xyz[:, 2] - grid_min[2]) / (grid_max[2] - grid_min[2]) * (voxel_resolution - 1)).long()
+            
+            # 确保索引在有效范围内
+            mask = (voxel_idx_x >= 0) & (voxel_idx_x < voxel_resolution) & \
+                (voxel_idx_y >= 0) & (voxel_idx_y < voxel_resolution) & \
+                (voxel_idx_z >= 0) & (voxel_idx_z < voxel_resolution)
+            
+            voxel_idx_x = voxel_idx_x[mask]
+            voxel_idx_y = voxel_idx_y[mask]
+            voxel_idx_z = voxel_idx_z[mask]
+            batch_opacity = batch_opacity[mask]
+            
+            # 更新密度网格
+            density_grid[voxel_idx_x, voxel_idx_y, voxel_idx_z] += batch_opacity.squeeze()
+        
+        # 识别内部空白区域
+        filled_mask = density_grid < density_threshold
+        
+        # 通过卷积操作查找内部区域
+        kernel_size = 5
+        kernel = torch.ones((1, 1, kernel_size, kernel_size, kernel_size), device=xyz.device)
+        input_tensor = density_grid.reshape(1, 1, voxel_resolution, voxel_resolution, voxel_resolution)
+        
+        print("识别内部空白区域...")
+        with torch.no_grad():
+            neighbor_sum = conv3d(input_tensor, kernel, padding=kernel_size//2)
+        neighbor_sum = neighbor_sum.reshape(voxel_resolution, voxel_resolution, voxel_resolution)
+        
+        # 如果周围有高密度，则为内部体素
+        interior_voxels = (filled_mask) & (neighbor_sum > 1.0)
+        
+        # 选择要填充的体素坐标
+        interior_indices = torch.nonzero(interior_voxels)
+        
+        if len(interior_indices) == 0:
+            print("未找到需要填充的内部区域")
+            return
+        
+        print(f"找到 {len(interior_indices)} 个内部体素需要填充")
+        
+        # 从内部体素生成新粒子
+        from tqdm import tqdm
+        
+        new_xyz_list = []
+        for idx in tqdm(interior_indices, desc="生成新粒子坐标"):
+            x = grid_min[0] + idx[0].item() * (grid_max[0] - grid_min[0]) / (voxel_resolution - 1)
+            y = grid_min[1] + idx[1].item() * (grid_max[1] - grid_min[1]) / (voxel_resolution - 1)
+            z = grid_min[2] + idx[2].item() * (grid_max[2] - grid_min[2]) / (voxel_resolution - 1)
+            
+            # 添加一些随机扰动以避免规则格子状排列
+            jitter = (torch.rand(3, device=xyz.device) - 0.5) * voxel_size * 0.5
+            new_xyz_list.append([x + jitter[0], y + jitter[1], z + jitter[2]])
+        
+        # 限制填充的粒子数量，避免内存溢出
+        max_fill_particles = 20000000
+        if len(new_xyz_list) > max_fill_particles:
+            print(f"限制填充粒子数量为 {max_fill_particles}")
+            indices = torch.randperm(len(new_xyz_list))[:max_fill_particles]
+            new_xyz_list = [new_xyz_list[idx.item()] for idx in indices]
+        
+        # 创建新的粒子属性
+        new_xyz = torch.tensor(new_xyz_list, dtype=torch.float, device=xyz.device)
+        num_new_particles = len(new_xyz)
+        
+        # 应用OpaqueAtom GS设置
+        # 1. 原子裁剪：限制高斯粒子的大小
+        atomic_scale = scene_extent * scaling_factor
+        new_scaling = torch.ones((num_new_particles, 3), device=xyz.device) * atomic_scale
+        new_scaling = self.scaling_inverse_activation(new_scaling)
+        
+        # 2. 均匀不透明化：分配完全不透明度
+        new_opacity = torch.ones((num_new_particles, 1), device=xyz.device) * opacity_value
+        new_opacity = self.inverse_opacity_activation(new_opacity)
+        
+        # 设置旋转属性为单位四元数
+        new_rotation = torch.zeros((num_new_particles, 4), device=xyz.device)
+        new_rotation[:, 0] = 1.0  # 单位四元数 [1, 0, 0, 0]
+        
+        # 设置颜色特征
+        new_features_dc = torch.zeros((num_new_particles, 1, 3), device=xyz.device)
+        new_features_rest = torch.zeros((num_new_particles, (self.max_sh_degree + 1) ** 2 - 1, 3), device=xyz.device)
+        
+        # 为每个新粒子找到最近的表面粒子并采用其颜色
+        print("为内部粒子分配颜色...")
+        batch_size = min(10000, num_new_particles)
+        
+        # 使用批处理方式计算最近邻
+        for i in range(0, num_new_particles, batch_size):
+            end_idx = min(i + batch_size, num_new_particles)
+            batch_new_xyz = new_xyz[i:end_idx]
+            
+            # 查找K个最近邻 - 使用distCUDA2计算距离
+            k = 5
+            # 对每个新点计算与所有已有点的距离
+            batch_dists = []
+            batch_idxs = []
+            
+            for j in range(batch_new_xyz.shape[0]):
+                point = batch_new_xyz[j:j+1]
+                # 使用distCUDA2计算点到所有已存在点的距离
+                dists = distCUDA2(point, xyz)
+                # 找到最近的k个点
+                topk_dists, topk_idx = torch.topk(dists, k=k, largest=False)
+                batch_dists.append(topk_dists)
+                batch_idxs.append(topk_idx)
+                
+            # 将列表转换为张量
+            dists = torch.stack(batch_dists)
+            idxs = torch.stack(batch_idxs)
+            
+            # 基于距离加权平均
+            weights = torch.exp(-dists)
+            weights_sum = weights.sum(dim=1, keepdim=True)
+            weights = weights / (weights_sum + 1e-8)
+            
+            # 获取并应用加权颜色
+            for j in range(k):
+                neighbor_indices = idxs[:, j]
+                neighbor_dc = self._features_dc[neighbor_indices]
+                neighbor_rest = self._features_rest[neighbor_indices]
+                
+                weight_factor = weights[:, j].view(-1, 1, 1)
+                new_features_dc[i:end_idx] += neighbor_dc * weight_factor
+                new_features_rest[i:end_idx] += neighbor_rest * weight_factor
+        
+        print(f"向模型添加 {num_new_particles} 个填充粒子...")
+        
+        # 添加新粒子到模型
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        
+        # 保存填充标志，表示模型已经被填充
+        self.filled = torch.tensor(True, device=xyz.device)
+        print("内部填充完成")
+                        
