@@ -146,18 +146,22 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def training_setup(self, training_args , only_shs = False, wo_xyz = False):
+    def training_setup(self, training_args , start_idx = 0 ,only_shs = False, wo_xyz = False, only_shs_zero = False):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-
+        self.optim_start_idx = start_idx
         if only_shs:
-            lr_scale = 1
-            l = [
+            lr_scale = 4
+            if only_shs_zero :
+                l = [
                 {'params': [self._features_dc], 'lr': training_args.feature_lr * lr_scale, "name": "f_dc"},
-                {'params': [self._features_rest], 'lr': training_args.feature_lr / 20 * lr_scale, "name": "f_rest"},
-                # {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            ]
+                ]
+            else :
+                l = [
+                    {'params': [self._features_dc], 'lr': training_args.feature_lr * lr_scale, "name": "f_dc"},
+                    {'params': [self._features_rest], 'lr': training_args.feature_lr / 20 * lr_scale, "name": "f_rest"},
+                ]
         elif wo_xyz:
             l = [
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -182,6 +186,25 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+
+
+    def zero_frozen_gradients(self):
+        """
+        在 optimizer.step() 之前调用此方法，
+        将索引 self.optim_start_idx 之前的元素的梯度清零。
+        """
+        if self.optim_start_idx <= 0: # 如果 start_idx 是 0 或负数，则无需操作
+            return
+
+        # 遍历优化器管理的参数
+        for group in self.optimizer.param_groups:
+            for param in group['params']:
+                if param.grad is not None:
+                    # 清零索引 self.optim_start_idx 之前部分的梯度
+                    # 使用 .data 避免在梯度操作本身上建立计算图
+                    param.grad.data[:self.optim_start_idx].zero_()
+
+
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''

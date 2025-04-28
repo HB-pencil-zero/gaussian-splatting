@@ -90,7 +90,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))  # + 0.07 * torch.exp(gaussians._scaling).norm()   # + 0.03 * torch.exp(gaussians._scaling).norm()  
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))  +   0.04 * torch.exp(gaussians._scaling).norm()   #0.05 * torch.exp(gaussians._scaling).norm()  
         loss.backward()
 
         iter_end.record()
@@ -322,8 +322,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5_000 , 30_000, 50_000, 80_000, 100_000, 150_000, 200_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[5_000 , 30_000, 50_000, 80_000, 100_000, 150_000, 200_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[2000,5_000 , 30_000, 50_000, 80_000, 100_000, 150_000, 200_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 2000 , 5_000 , 30_000, 50_000, 80_000, 100_000, 150_000, 200_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
