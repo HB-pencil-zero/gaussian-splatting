@@ -152,7 +152,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.optim_start_idx = start_idx
         if only_shs:
-            lr_scale = 4
+            lr_scale = 1
             if only_shs_zero :
                 l = [
                 {'params': [self._features_dc], 'lr': training_args.feature_lr * lr_scale, "name": "f_dc"},
@@ -314,10 +314,28 @@ class GaussianModel:
 
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
-        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
+        
+        # 计算期望的球谐函数系数数量
+        expected_count = 3*(self.max_sh_degree + 1) ** 2 - 3
+        
+        # 如果球谐函数系数不够，补充缺失的属性名
+        if len(extra_f_names) < expected_count:
+            # 生成所有期望的属性名
+            all_expected_names = [f"f_rest_{i}" for i in range(expected_count)]
+            # 找出缺失的属性名
+            existing_indices = {int(name.split('_')[-1]) for name in extra_f_names}
+            missing_names = [name for i, name in enumerate(all_expected_names) if i not in existing_indices]
+            # 将缺失的属性名添加到列表中并重新排序
+            extra_f_names = sorted(extra_f_names + missing_names, key = lambda x: int(x.split('_')[-1]))
+        
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
-            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            # 如果属性存在就读取，不存在就用0填充（已经是0，所以不需要额外操作）
+            try:
+                features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            except (KeyError, ValueError):
+                # 如果属性不存在，features_extra[:, idx] 已经是0，不需要额外操作
+                pass
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
 
